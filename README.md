@@ -12,9 +12,10 @@ Home Credit lends to customers with little or no formal credit history. This pro
 |------|---------|
 | [`data_preparation.py`](data_preparation.py) | Reusable cleaning and feature engineering functions (described below) |
 | [`notebooks/eda.qmd`](notebooks/eda.qmd) | Exploratory data analysis notebook (Quarto source) |
-| [`notebooks/styles.css`](notebooks/styles.css) | Stylesheet used when rendering the EDA notebook to HTML |
+| [`notebooks/modeling.qmd`](notebooks/modeling.qmd) | Modeling notebook: benchmarks, candidate models, class imbalance, tuning, Kaggle submission (Quarto source) |
+| [`notebooks/styles.css`](notebooks/styles.css) | Stylesheet used when rendering the notebooks to HTML |
 | [`docs/feature_report.md`](docs/feature_report.md) | Research on the risk features lenders use, mapped to the data |
-| `.gitignore` | Keeps data files and generated outputs out of the repository |
+| `.gitignore` | Keeps data files, submissions, model files and rendered outputs out of the repository |
 
 Data files are not committed. Download them from Kaggle into `data/raw/` (see [How to run](#how-to-run)).
 
@@ -179,3 +180,58 @@ All output files are excluded from the repository by `.gitignore`.
 ### Use of AI
 
 I used Claude (Anthropic) to help write the script, working one stage at a time: the fit/transform structure, cleaning, feature engineering, then consistency checks. At each stage I checked the logic against my EDA decisions and the outputs against the data. The consistency checks earned their place on the first full run: they caught a test-only blank (the recoded `-1` region rating) that the first version could not fill, which led to learning a median for every numeric column.
+
+---
+
+## Modeling
+
+The [modeling notebook](notebooks/modeling.qmd) uses the output of `data_preparation.py` (249 predictors after excluding `CODE_GENDER`) and evaluates every model with 3-fold stratified cross-validation (CV) on AUC.
+
+### Models tried and performance
+
+| Model | CV AUC | Run time (3-fold CV) |
+|---|---|---|
+| Majority class (benchmark) | 0.500 (accuracy 91.9%) | under 1 s |
+| Logistic regression on `EXT_SOURCE_MEAN` only (benchmark) | 0.716 | under 1 s |
+| Logistic regression, 41 EDA shortlist predictors | 0.7416 | 2 s |
+| Random forest | 0.7468 | 38 s |
+| Logistic regression, all 249 predictors | 0.7507 | 16 s |
+| LightGBM, default settings | 0.7648 | 43 s |
+| XGBoost, default settings | 0.7658 | 60 s |
+| **LightGBM, tuned (final model)** | **0.7691** | 5.7 min (with early stopping) |
+
+**Class imbalance.** On a 60,000-row sample, no adjustment (AUC 0.7448) beat class weights (0.7407), random undersampling (0.7384), random upsampling (0.7422) and SMOTE (0.7442). Resampling was applied inside each training fold only.
+
+**Tuning.** A randomized search (20 settings, 3-fold CV, 60,000-row stratified sample) selected a slow learning rate (0.010), 42 leaves, at least 100 applicants per leaf and about 38% of predictors per tree. Because the best number of trees grows with the size of the data, the tree count was re-selected on the full data with early stopping (2,593 trees).
+
+### Why the final model was chosen
+
+- **Highest cross-validated AUC** of all candidates (0.7691), ahead of XGBoost and the untuned LightGBM.
+- **Fast**: about 30% faster than XGBoost at default settings, and the final model trains on all 307,511 applicants in about 2.5 minutes, so monthly retraining is cheap.
+- **Calibrated probabilities**: no resampling was used, so a predicted 15% risk means roughly 15 defaults per 100 such applicants. This lets the business set the approval cutoff directly from the cost of each mistake.
+- Logistic regression on the shortlist is kept as the **interpretable benchmark** for explaining decisions.
+
+### Final model performance
+
+| Measure | Value |
+|---|---|
+| Cross-validated AUC (out-of-sample) | 0.7691 |
+| Train AUC (in-sample) | 0.8486 |
+| CV AUC, thin-file applicants / applicants with a bureau record | 0.749 / 0.771 |
+| **Kaggle score** | KAGGLE_SCORE_PLACEHOLDER |
+
+### Business results (illustrative economics: 10% margin, 50% loss on default)
+
+- The best approval cutoff declines applicants with a predicted default probability above 16%, approving 87% of applicants and lowering their default rate from 8.1% to 5.5%.
+- The project's success metric, a 10% relative reduction in the default rate among approved loans, is reached by declining only the riskiest 2.4% of applicants.
+- Gender is excluded from the model but used to check outcomes: at the cutoff, 89.6% of women and 83.0% of men are approved. A formal disparate impact analysis is planned for the model card.
+
+### How to run
+
+With the raw data in `data/raw/`, run from the `notebooks/` folder (the notebook calls the preparation functions itself):
+
+```bash
+quarto render modeling.qmd
+```
+
+Additional requirements: `scikit-learn`, `imbalanced-learn`, `lightgbm`, `xgboost`, `matplotlib`, `seaborn`. A full render takes about 25 minutes on a 2-core machine. The Kaggle submission is written to `submissions/submission_lgbm_tuned.csv`, which is excluded from the repository.
