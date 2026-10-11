@@ -17,9 +17,15 @@ __pycache__/
 .venv/
 venv/
 
-# Quarto render artifacts
+# Quarto render artifacts (the rendered HTML is submitted on Canvas, not committed)
 notebooks/*_files/
+notebooks/*.html
+notebooks/*.quarto_ipynb
 .quarto/
+
+# Model outputs: Kaggle submissions and saved models
+submissions/
+models/
 
 # OS files
 .DS_Store
