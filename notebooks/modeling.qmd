@@ -378,7 +378,7 @@ submission.to_csv(out_dir / "submission_lgbm_tuned.csv", index=False)   # saved 
 print(f"{len(submission):,} test predictions written; mean predicted default probability {submission.TARGET.mean():.3f}")
 ```
 
-**Kaggle score:** KAGGLE_SCORE_PLACEHOLDER
+**Kaggle score:** private AUC **0.76334**, public AUC **0.76591** (late submission, scored after the competition deadline). Both are within 0.006 of the cross-validated AUC of 0.7691, so the cross-validation estimate held up on applicants the model had never seen.
 
 Kaggle scores a submission by AUC on test applicants whose outcomes are hidden: the public score uses about 20% of the test set and the private score the remaining 80%. A Kaggle AUC close to the cross-validated AUC from Section 7 confirms that the cross-validation estimate was honest.
 
