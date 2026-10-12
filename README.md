@@ -218,7 +218,7 @@ The [modeling notebook](notebooks/modeling.qmd) uses the output of `data_prepara
 | Cross-validated AUC (out-of-sample) | 0.7691 |
 | Train AUC (in-sample) | 0.8486 |
 | CV AUC, thin-file applicants / applicants with a bureau record | 0.749 / 0.771 |
-| **Kaggle score** | KAGGLE_SCORE_PLACEHOLDER |
+| **Kaggle score** (late submission) | **Private 0.76334, Public 0.76591** |
 
 ### Business results (illustrative economics: 10% margin, 50% loss on default)
 
