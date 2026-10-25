@@ -368,6 +368,17 @@ plt.tight_layout(); plt.show()
 
 **Interpretation.** The external scores dominate, as the EDA predicted, followed by the engineered features: `EXT_SOURCE_MEAN`, `CREDIT_TO_ANNUITY`, loan-to-value, age, and employment tenure. Several of the top predictors were created in data preparation, which confirms that the feature engineering added real signal. The presence of `EXT_SOURCE_1` and `AGE_YEARS` near the top, which the EDA found related to age and gender, is the reason a fairness check is required before deployment (Section 9.3).
 
+## Saving the model for the model card
+
+The final model and its out-of-fold predictions are saved locally so the model card can reuse them without retraining. The `models/` folder is listed in `.gitignore`.
+
+```{python}
+# Save the trained model and the out-of-fold probabilities (not committed to GitHub)
+model_dir = Path("../models"); model_dir.mkdir(exist_ok=True)
+final_model.booster_.save_model(str(model_dir / "final_lgbm.txt"))
+pd.DataFrame({"SK_ID_CURR": train["SK_ID_CURR"], "oof": oof}).to_parquet(model_dir / "oof_predictions.parquet", index=False)
+```
+
 # Kaggle submission
 
 ```{python}
