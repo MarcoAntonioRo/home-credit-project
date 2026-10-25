@@ -13,6 +13,7 @@ Home Credit lends to customers with little or no formal credit history. This pro
 | [`data_preparation.py`](data_preparation.py) | Reusable cleaning and feature engineering functions (described below) |
 | [`notebooks/eda.qmd`](notebooks/eda.qmd) | Exploratory data analysis notebook (Quarto source) |
 | [`notebooks/modeling.qmd`](notebooks/modeling.qmd) | Modeling notebook: benchmarks, candidate models, class imbalance, tuning, Kaggle submission (Quarto source) |
+| [`notebooks/model_card.qmd`](notebooks/model_card.qmd) | Model card: decision threshold, SHAP explainability, adverse action reasons, fairness and limitations (Quarto source) |
 | [`notebooks/styles.css`](notebooks/styles.css) | Stylesheet used when rendering the notebooks to HTML |
 | [`docs/feature_report.md`](docs/feature_report.md) | Research on the risk features lenders use, mapped to the data |
 | `.gitignore` | Keeps data files, submissions, model files and rendered outputs out of the repository |
@@ -235,3 +236,39 @@ quarto render modeling.qmd
 ```
 
 Additional requirements: `scikit-learn`, `imbalanced-learn`, `lightgbm`, `xgboost`, `matplotlib`, `seaborn`. A full render takes about 25 minutes on a 2-core machine. The Kaggle submission is written to `submissions/submission_lgbm_tuned.csv`, which is excluded from the repository.
+
+---
+
+## Model card
+
+The [model card](notebooks/model_card.qmd) documents the final LightGBM model for a business stakeholder deciding whether to deploy it. It reuses the trained model saved by the modeling notebook (`models/final_lgbm.txt`, not committed) and renders to HTML with all code hidden.
+
+### What it covers
+
+| Section | Summary |
+|---|---|
+| Executive summary | Recommendation, expected financial impact and key caveats on one page |
+| Model details and intended use | Algorithm, hyperparameters, training data, users, decisions supported and out-of-scope uses |
+| Performance | AUC 0.769 cross-validated, 0.763 (private) / 0.766 (public) on Kaggle; precision 19.6% and recall 60.6% at the chosen threshold; calibration check |
+| Decision threshold | Cost assumptions from published sources: 8% lifetime profit on a repaid loan (Home Credit FY2018 net interest margin and cost-to-income ratio), 70% loss given default (net recoveries of about 30% on unsecured consumer loans; Basel 45% as the optimistic case). Break-even and back-tested optimum agree at about **10%** |
+| Sensitivity analysis | Outcomes across thresholds, and the best threshold under nine margin and loss scenarios (about 5% to 22%) |
+| Explainability (SHAP) | SHAP summary on a 1,000-applicant sample; external credit scores, loan structure and loan-to-value lead |
+| Adverse action mapping | Top features translated into plain-language decline reasons, with an example notice |
+| Fairness | Approval rates by gender and education with adverse impact ratios (men 0.87; lower secondary education 0.74) |
+| Limitations and risks | Thin-file accuracy, drift, selection bias, missing data, compliance and cutoff risks, monitoring plan |
+
+### Key results at the 10% threshold
+
+- Approval rate 75%; default rate among approved loans falls from 8.1% to 4.2%.
+- Back-tested net profit rises from 3.94 to 6.79 billion (local currency), about +72%.
+- The model uses marital status, which ECOA / Regulation B prohibits. Retraining without it leaves AUC unchanged (0.7687 vs 0.7688), so it should be removed before any deployment.
+
+### How to run
+
+Render the modeling notebook first (it saves `models/final_lgbm.txt` and `models/oof_predictions.parquet`), then from `notebooks/`:
+
+```bash
+quarto render model_card.qmd
+```
+
+Additional requirement: `shap`. The render takes about 3 minutes.
