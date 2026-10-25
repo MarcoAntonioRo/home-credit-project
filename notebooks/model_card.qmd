@@ -1,0 +1,548 @@
+---
+title: "Model Card: Home Credit Default Risk Model"
+subtitle: "LightGBM credit risk score, version 1.0 · IS 6812 MSBA Capstone"
+author: "Marco Rodriguez"
+date: "2026-10-25"
+date-format: "MMMM D, YYYY"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    css: styles.css
+    fig-width: 8
+    fig-height: 4
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+# All computation for the card happens here and in the hidden cells below; the reader sees only results.
+import re, sys, json, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import lightgbm as lgb
+import shap
+from sklearn.metrics import roc_auc_score
+from IPython.display import Markdown, display
+
+warnings.filterwarnings("ignore")
+pd.set_option("display.max_colwidth", None)
+plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "font.size": 10,
+                     "axes.titleweight": "bold", "axes.titlesize": 11})
+INK, PURPLE, ORANGE, GRAY, GREEN, BLUE = "#2A313A", "#4C3BCF", "#E8A33D", "#C2CCD5", "#197A46", "#5FA8D3"
+SEED = 42
+
+sys.path.insert(0, str(Path("..").resolve()))
+from data_preparation import fit_preparation, transform
+
+# Data and the preparation used in the modeling notebook (parameters learned from train only)
+raw = pd.read_csv("../data/raw/application_train.csv")
+params = fit_preparation(raw)
+train = transform(raw, params)
+y = train["TARGET"].astype(int).to_numpy()
+gender_cols = [c for c in train.columns if c.startswith("CODE_GENDER")]
+X = train.drop(columns=["SK_ID_CURR", "TARGET"] + gender_cols).astype("float32")
+X.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", c) for c in X.columns]
+
+# Reuse the final model and its out-of-fold predictions saved by the modeling notebook (no retraining)
+booster = lgb.Booster(model_file="../models/final_lgbm.txt")
+assert booster.feature_name() == list(X.columns)
+oof = pd.read_parquet("../models/oof_predictions.parquet")["oof"].to_numpy()   # each applicant scored by a model that never saw them
+credit = raw["AMT_CREDIT"].to_numpy()
+
+AUC_CV, KAGGLE_PRIVATE, KAGGLE_PUBLIC = 0.7691, 0.76334, 0.76591   # from the modeling notebook and Kaggle
+```
+
+```{python}
+#| label: economics
+# ---------------- Cost assumptions (sources in Section 4.1) ----------------
+NIM, COST_INCOME = 0.158, 0.422        # Home Credit B.V. FY2018: net interest margin, cost-to-income ratio
+annual_margin = NIM * (1 - COST_INCOME)                      # pre-loss profit per year on a performing loan
+term_months = float((raw["AMT_CREDIT"] / raw["AMT_ANNUITY"]).median())   # typical number of payments
+AVG_BALANCE = 0.52                                           # average outstanding share of principal on an amortizing loan
+MARGIN = round(annual_margin * AVG_BALANCE * term_months / 12, 2)   # lifetime profit on a repaid loan, share of credit
+RECOVERY = 0.30                                              # net discounted recovery on defaulted unsecured consumer loans
+LGD = 1 - RECOVERY
+
+def outcomes(t, margin=MARGIN, lgd=LGD, p=oof):
+    """Business outcomes if applicants with predicted default probability below t are approved."""
+    approve = p < t
+    decline = ~approve
+    profit = margin * credit[approve & (y == 0)].sum() - lgd * credit[approve & (y == 1)].sum()
+    tp = (decline & (y == 1)).sum()
+    return {"Threshold": t, "Approval rate": approve.mean(),
+            "Default rate (approved)": y[approve].mean() if approve.any() else np.nan,
+            "Precision": tp / decline.sum() if decline.any() else np.nan,
+            "Recall": tp / y.sum(), "Net profit (bn)": profit / 1e9}
+
+grid = np.round(np.arange(0.02, 0.401, 0.0025), 4)
+curve = pd.DataFrame([outcomes(t) for t in grid])
+t_emp = curve.loc[curve["Net profit (bn)"].idxmax(), "Threshold"]
+t_break = MARGIN / (MARGIN + LGD)                            # approve while expected profit (1-p)*margin - p*LGD > 0
+THRESHOLD = round(t_break, 2)                                # chosen operating threshold (rounded break-even)
+chosen = outcomes(THRESHOLD)
+baseline = outcomes(1.01)                                    # current practice: every applicant in the data was approved
+uplift = chosen["Net profit (bn)"] - baseline["Net profit (bn)"]
+n_app = len(y)
+```
+
+# Executive summary {.unnumbered}
+
+::: {.callout-note appearance="minimal"}
+**Recommendation: approve a 3-month shadow test, then a controlled pilot, of the risk score at a `{python} f"{THRESHOLD:.0%}"` default-probability cutoff, after removing marital status from the model.**
+:::
+
+**What the model does.** It estimates each applicant's probability of payment difficulty using only information Home Credit already collects at application time. It ranks risk reliably: on applicants it never saw, it puts a defaulter above a repayer 77% of the time (AUC `{python} f"{AUC_CV:.3f}"`), confirmed on Kaggle's hidden test set (`{python} f"{KAGGLE_PRIVATE:.3f}"`).
+
+**Expected financial impact at the recommended cutoff** (back-tested on `{python} f"{n_app:,}"` historical loans, researched cost assumptions):
+
+```{python}
+#| label: exec-table
+exec_tbl = pd.DataFrame({
+    "Current practice (approve all)": [f"{baseline['Approval rate']:.0%}", f"{baseline['Default rate (approved)']:.1%}", f"{baseline['Net profit (bn)']:.2f}"],
+    f"Model cutoff {THRESHOLD:.0%}": [f"{chosen['Approval rate']:.0%}", f"{chosen['Default rate (approved)']:.1%}", f"{chosen['Net profit (bn)']:.2f}"],
+}, index=["Approval rate", "Default rate among approved loans", "Net profit (billions, local currency)"])
+exec_tbl
+```
+
+- Net profit rises by about **`{python} f"{uplift:.1f}"` billion (+`{python} f"{uplift / baseline['Net profit (bn)']:.0%}"`)**, because the defaults avoided cost far more than the margin given up on good borrowers who are declined.
+- The default rate among approved loans falls from `{python} f"{baseline['Default rate (approved)']:.1%}"` to `{python} f"{chosen['Default rate (approved)']:.1%}"`, well beyond the project goal of a 10% relative reduction.
+- **The trade-off:** about `{python} f"{1 - chosen['Approval rate']:.0%}"` of applicants would be declined. If Home Credit's real loss on a default is closer to 45% (the Basel benchmark), the best cutoff rises to about 15% and approvals to about 85% (Section 4).
+
+**Key caveats**
+
+1. **Cost assumptions drive the cutoff.** Margin and recovery come from published sources, not Home Credit's internal books; the cutoff must be reset with actual figures.
+2. **Compliance fixes before any live use.** The model uses marital status, which U.S. fair lending law (ECOA / Regulation B) prohibits, and age and region, which need legal review. Gender is excluded.
+3. **Fairness gaps exist.** Men and applicants without higher education are approved less often. The gaps track real repayment differences but must be reviewed formally (Section 7).
+4. **Thin-file applicants are scored less accurately**, which matters for a lender whose mission is serving them (Section 8).
+
+# Model details
+
+```{python}
+#| label: details
+hp = {"Algorithm": "LightGBM gradient-boosted decision trees (binary classification)",
+      "Version": "1.0 (October 2026), LightGBM " + lgb.__version__,
+      "Training data": f"Home Credit Default Risk (Kaggle), application_train.csv: {n_app:,} loans, default rate {y.mean():.2%}",
+      "Inputs": f"{X.shape[1]} application-time features from data_preparation.py (gender excluded)",
+      "Output": "Probability of payment difficulty (0 to 1); higher = riskier",
+      "Number of trees": "2,593 (selected by early stopping on the full data)",
+      "Learning rate": "0.0103",
+      "Leaves per tree": "42",
+      "Minimum applicants per leaf": "100",
+      "Rows / features sampled per tree": "84% / 38%",
+      "L2 regularization (lambda)": "1.45",
+      "Validation": "3-fold stratified cross-validation; Kaggle hidden test set (48,744 applicants)",
+      "Owner": "Marco Rodriguez, University of Utah MSBA"}
+pd.DataFrame({"Detail": hp.values()}, index=hp.keys())
+```
+
+**How it was built.** Five candidate models were compared with cross-validation (two logistic regressions, a random forest, XGBoost and LightGBM). LightGBM ranked best and was tuned with a 20-setting randomized search; no resampling was applied, so the predicted probabilities stay calibrated (Section 3.3). Full details are in the modeling notebook.
+
+# Intended use
+
+**Primary users.** Credit underwriting and risk teams at Home Credit, and loan officers who review borderline applications.
+
+**Decisions it informs.**
+
+- Approve or decline a new consumer loan application, using the probability score against a business-set cutoff.
+- Route applications near the cutoff to manual review.
+- Provide the principal reasons for a decline (adverse action notices, Section 6).
+
+**Out of scope.**
+
+- Setting interest rates, credit limits or loan amounts (the model was not trained for pricing).
+- Collections, fraud detection or marketing targeting.
+- Fully automated decisions without human oversight, or use in markets and products unlike the training data (for example mortgages).
+- Any decision that uses the score as a proxy for a person's character or worth.
+
+# Performance metrics
+
+## Ranking quality (AUC)
+
+```{python}
+#| label: auc-table
+pd.DataFrame({"AUC": [f"{AUC_CV:.4f}", f"{KAGGLE_PRIVATE:.4f}", f"{KAGGLE_PUBLIC:.4f}", "0.5000"],
+              "What it measures": ["Out-of-fold on 307,511 training applicants (3-fold CV)",
+                                   "Kaggle hidden test set, private leaderboard (~80% of 48,744)",
+                                   "Kaggle hidden test set, public leaderboard (~20%)",
+                                   "Benchmark: approve everyone (no ranking ability)"]},
+             index=["Cross-validated", "Kaggle private", "Kaggle public", "Majority class"])
+```
+
+AUC answers "how often does the model rate a random defaulter as riskier than a random repayer?" A score of 0.77 is solid for application-only data; the Kaggle scores are within 0.006 of the cross-validated estimate, so the model generalizes to new applicants.
+
+## Precision and recall at the chosen threshold
+
+Applicants whose predicted probability is at or above **`{python} f"{THRESHOLD:.0%}"`** are flagged as likely defaulters (declined).
+
+```{python}
+#| label: confusion
+pred_default = oof >= THRESHOLD
+tp = int((pred_default & (y == 1)).sum()); fp = int((pred_default & (y == 0)).sum())
+fn = int((~pred_default & (y == 1)).sum()); tn = int((~pred_default & (y == 0)).sum())
+cm = pd.DataFrame({"Predicted default (decline)": [f"{tp:,}", f"{fp:,}"],
+                   "Predicted repay (approve)": [f"{fn:,}", f"{tn:,}"]},
+                  index=["Actually defaulted", "Actually repaid"])
+metrics = pd.DataFrame({"Value": [f"{tp / (tp + fp):.1%}", f"{tp / (tp + fn):.1%}", f"{tn / (tn + fp):.1%}",
+                                  f"{(tp + tn) / n_app:.1%}"],
+                        "Plain-English meaning": ["Of the applicants declined, the share who would have defaulted",
+                                                  "Of all defaulters, the share the model catches",
+                                                  "Of all good borrowers, the share still approved",
+                                                  "Share of all decisions that match the actual outcome"]},
+                       index=["Precision", "Recall", "Specificity", "Accuracy"])
+display(cm); display(metrics)
+```
+
+Precision looks low only because defaults are rare (8%): a declined applicant is still about `{python} f"{(tp / (tp + fp)) / y.mean():.1f}"` times as likely to default as the average applicant. Recall shows the model stops `{python} f"{tp / (tp + fn):.0%}"` of defaults while approving `{python} f"{tn / (tn + fp):.0%}"` of good borrowers.
+
+## Calibration: can the probabilities be taken literally?
+
+```{python}
+#| label: calibration
+#| fig-height: 3.4
+dec = pd.qcut(oof, 10, labels=False)
+cal = pd.DataFrame({"pred": oof, "actual": y}).groupby(dec).mean()
+fig, ax = plt.subplots(figsize=(8, 3.4))
+ax.plot([0, 0.3], [0, 0.3], ls=":", color="grey", label="Perfect calibration")
+ax.plot(cal["pred"], cal["actual"], "o-", color=PURPLE, label="Model (10 risk groups)")
+ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0)); ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+ax.set_xlabel("Average predicted default probability"); ax.set_ylabel("Actual default rate")
+ax.set_title("Predicted vs. actual default rate by risk group (out-of-fold)")
+ax.legend(frameon=False); plt.tight_layout(); plt.show()
+```
+
+The points sit on the diagonal: applicants given a 15% probability default about 15% of the time. That is what makes the cost-based threshold in Section 4 valid.
+
+# Decision threshold analysis
+
+## Cost assumptions and sources
+
+```{python}
+#| label: assumptions
+pd.DataFrame({
+    "Value": [f"{NIM:.1%}", f"{COST_INCOME:.1%}", f"{annual_margin:.1%} per year", f"{term_months:.0f} payments",
+              f"{MARGIN:.0%} of loan amount", f"{RECOVERY:.0%}", f"{LGD:.0%} of loan amount"],
+    "Basis": ["Home Credit B.V. FY2018 results [1]", "Home Credit B.V. FY2018 results [1]",
+              "Net interest margin × (1 − cost-to-income)",
+              "Median loan amount ÷ installment in the training data",
+              "Annual margin × 52% average balance × term in years",
+              "Net discounted recovery, unsecured consumer loans, European lender [3]",
+              "1 − recovery; Basel benchmark for unsecured claims is 45% [2]"]},
+    index=["Net interest margin", "Cost-to-income ratio", "Pre-loss margin", "Typical loan term",
+           "Profit on a repaid loan", "Recovery on a defaulted loan", "Loss given default (LGD)"])
+```
+
+- **Profit on a repaid loan.** Home Credit reported a 15.8% net interest margin and a 42.2% cost-to-income ratio for 2018 [1], leaving about 9.1% a year before credit losses. A typical loan here runs `{python} f"{term_months:.0f}"` installments and amortizes, so on average about half the principal is outstanding: lifetime profit ≈ **`{python} f"{MARGIN:.0%}"`** of the amount lent.
+- **Loss given default.** Collections research on unsecured consumer loans at a European bank found net discounted recoveries of about 30% for better-performing defaulters and 15% for the worst [3], so LGD ≈ **70%** (range 70 to 85%). The Basel framework assigns 45% to senior unsecured claims [2], used here as the optimistic case. For context, Home Credit's 2018 cost of risk was 9.4% of loans [1].
+
+## Choosing the threshold
+
+Approving an applicant with default probability *p* is worth (1 − *p*) × margin − *p* × LGD. That is positive while *p* < margin ÷ (margin + LGD) = **`{python} f"{t_break:.1%}"`**. Because the model is calibrated, this break-even point should match the back-tested optimum, and it does: the profit curve below peaks at `{python} f"{t_emp:.1%}"`. The operating threshold is set at **`{python} f"{THRESHOLD:.0%}"`**.
+
+```{python}
+#| label: profit-curve
+#| fig-height: 4.2
+fig, ax = plt.subplots(figsize=(8, 4.2))
+for (m, l, lab, col, ls) in [(MARGIN, 0.45, "Optimistic: LGD 45%", GRAY, "--"), (MARGIN, LGD, f"Base: LGD {LGD:.0%}", PURPLE, "-"),
+                             (MARGIN, 0.85, "Pessimistic: LGD 85%", INK, ":")]:
+    c = [outcomes(t, m, l)["Net profit (bn)"] for t in grid]
+    ax.plot(grid, c, ls, color=col, label=lab, lw=2 if ls == "-" else 1.5)
+ax.axvline(THRESHOLD, color=ORANGE, lw=1.5, label=f"Chosen threshold {THRESHOLD:.0%}")
+ax.axhline(baseline["Net profit (bn)"], color=PURPLE, lw=0.8, alpha=0.5)
+ax.text(0.27, baseline["Net profit (bn)"] - 0.35, "Approve everyone (base case)", color=PURPLE, fontsize=8)
+ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+ax.set_xlabel("Decline applicants with predicted default probability above…")
+ax.set_ylabel("Net profit (billions)")
+ax.set_title("Back-tested net profit by threshold, three loss assumptions")
+ax.legend(frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=4); plt.tight_layout(); plt.show()
+```
+
+## Sensitivity analysis
+
+**Outcomes at different thresholds (base assumptions):**
+
+```{python}
+#| label: sensitivity
+rows = [outcomes(t) for t in [0.05, 0.08, THRESHOLD, 0.12, 0.15, 0.20, 0.30]] + [baseline]
+sens = pd.DataFrame(rows)
+sens["Threshold"] = [f"{t:.0%}" for t in sens["Threshold"][:-1]] + ["Approve all"]
+sens = sens.set_index("Threshold")
+sens.style.format({"Approval rate": "{:.1%}", "Default rate (approved)": "{:.1%}", "Precision": "{:.1%}",
+                   "Recall": "{:.1%}", "Net profit (bn)": "{:.2f}"}, na_rep="n/a") \
+    .apply(lambda r: ["font-weight:bold; background:#F3F1FD" if r.name == f"{THRESHOLD:.0%}" else "" for _ in r], axis=1)
+```
+
+**Best threshold under different cost assumptions:**
+
+```{python}
+#| label: scenario-grid
+cells = {}
+for m in [0.05, MARGIN, 0.12]:
+    col = {}
+    for l in [0.45, 0.70, 0.85]:
+        c = pd.DataFrame([outcomes(t, m, l) for t in grid]); best = c.loc[c["Net profit (bn)"].idxmax()]
+        col[f"LGD {l:.0%}"] = f"{best['Threshold']:.1%} (approve {best['Approval rate']:.0%})"
+    cells[f"Margin {m:.0%}"] = col
+pd.DataFrame(cells)
+```
+
+**Reading the sensitivity.** Lower thresholds cut defaults further but decline many good borrowers, and profit falls; higher thresholds approve more people but let costly defaults through. The best cutoff moves from about 5% to 22% as the cost assumptions change, so **the single most valuable next step is replacing these published figures with Home Credit's own margin and recovery data.** In every scenario the model beats approving everyone; the gain is smallest when margins are high and losses are low.
+
+# Explainability (SHAP)
+
+SHAP breaks each prediction into contributions from each feature: how much that feature pushed this applicant's risk up or down compared with the average applicant. The summary below uses a random sample of 1,000 applicants.
+
+```{python}
+#| label: shap
+sample = X.sample(1000, random_state=SEED)
+explainer = shap.TreeExplainer(booster)
+sv = np.asarray(explainer.shap_values(sample))
+mean_abs = pd.Series(np.abs(sv).mean(axis=0), index=X.columns).sort_values(ascending=False)
+top = mean_abs.head(15)
+```
+
+```{python}
+#| label: shap-beeswarm
+#| fig-height: 5.6
+shap.summary_plot(sv, sample, max_display=15, show=False, plot_size=(8, 5.6), color_bar_label="Feature value")
+plt.title("SHAP summary: top 15 features (1,000 applicants)", fontweight="bold", fontsize=11)
+plt.xlabel("Impact on predicted risk (log-odds); right = riskier")
+plt.tight_layout(); plt.show()
+```
+
+Each dot is one applicant. Red dots are high values of the feature, blue are low; dots to the right raised that applicant's risk.
+
+```{python}
+#| label: shap-bar
+#| fig-height: 4.2
+share = (top / mean_abs.sum())[::-1]
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.barh(share.index, share.values, color=[PURPLE if v == share.max() else GRAY for v in share.values])
+for i, v in enumerate(share.values):
+    ax.text(v + 0.002, i, f"{v:.1%}", va="center", fontsize=8)
+ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+ax.set_xlabel("Share of total SHAP impact (mean |SHAP|)")
+ax.set_title("Top 15 features by average impact on predictions")
+plt.tight_layout(); plt.show()
+```
+
+**Top predictive features in business terms**
+
+1. **External credit scores** (`EXT_SOURCE_MEAN`, `_2`, `_3`, `_1`): by far the strongest signal. Low scores sharply raise risk; a missing score is itself a warning sign.
+2. **Loan structure** (`CREDIT_TO_ANNUITY`, `AMT_ANNUITY`): the number and size of installments. The effect is non-linear: very short and very long terms behave differently, so it cannot be summarized as "longer is riskier".
+3. **Loan amount vs. goods price** (`LOAN_TO_VALUE`, `AMT_GOODS_PRICE`): borrowing well above the price of the item financed raises risk.
+4. **Stability signals** (`YEARS_SINCE_ID_PUBLISH`, `EMPLOYED_YEARS`, `EMPLOYED_TO_AGE`): recently issued identity documents and short job tenure raise risk.
+5. **Personal characteristics** (`NAME_EDUCATION_TYPE`, `NAME_FAMILY_STATUS`, age): higher education and being married lower predicted risk. These carry legal and fairness implications (Sections 6 and 7).
+
+# Adverse action mapping
+
+U.S. law (ECOA / Regulation B) requires that declined applicants receive the specific principal reasons for the decision. The table translates each top model feature into a plain-language reason, used only when that feature pushes the applicant's risk **up**.
+
+```{python}
+#| label: reasons
+REASONS = {
+    "EXT_SOURCE_MEAN": ("low", "Limited or weak credit history with external credit agencies"),
+    "EXT_SOURCE_3": ("low", "Limited or weak credit history with external credit agencies"),
+    "EXT_SOURCE_2": ("low", "Limited or weak credit history with external credit agencies"),
+    "EXT_SOURCE_1": ("low", "Limited or weak credit history with external credit agencies"),
+    "EXT_SOURCE_1_MISSING": ("missing", "Insufficient credit information available from external agencies"),
+    "EXT_SOURCE_MISSING_COUNT": ("high", "Insufficient credit information available from external agencies"),
+    "CREDIT_TO_ANNUITY": ("pattern", "Requested repayment term"),
+    "AMT_ANNUITY": ("high", "Installment amount is high"),
+    "LOAN_TO_VALUE": ("high", "Loan amount is high relative to the price of the goods financed"),
+    "AMT_GOODS_PRICE": ("low", "Loan amount is high relative to the price of the goods financed"),
+    "YEARS_SINCE_ID_PUBLISH": ("low", "Identity document issued or changed recently"),
+    "EMPLOYED_YEARS": ("low", "Length of employment"),
+    "EMPLOYED_TO_AGE": ("low", "Short employment history"),
+    "YEARS_SINCE_PHONE_CHANGE": ("low", "Recent change of contact phone number"),
+    "YEARS_SINCE_REGISTRATION": ("low", "Recent change of registration address"),
+    "OWN_CAR_AGE": ("high", "Age of vehicle owned"),
+    "FLAG_WORK_PHONE": ("yes", "Contact information provided"),
+    "REGION_POPULATION_RELATIVE": ("pattern", "Region of residence (requires legal review)"),
+    "NAME_EDUCATION_TYPE_Higher_education": ("no", "Education level (requires fair lending review)"),
+    "NAME_FAMILY_STATUS_Married": ("no", "Marital status (prohibited under ECOA: remove)"),
+    "AGE_YEARS": ("pattern", "Age (permitted only if applicants 62+ are not disadvantaged: legal review)"),
+}
+def flag(f):
+    return "Prohibited / review" if any(k in REASONS.get(f, ("", ""))[1] for k in ["prohibited", "review"]) else "Usable"
+tbl = pd.DataFrame({"Feature": top.index,
+                    "Raises risk when": [REASONS.get(f, ("pattern", ""))[0] for f in top.index],
+                    "Adverse action reason given to applicant": [REASONS.get(f, ("", "Other application information"))[1] for f in top.index],
+                    "Status": [flag(f) for f in top.index]})
+tbl.index = range(1, len(tbl) + 1)
+tbl.style.apply(lambda r: ["color:#B42318; font-weight:bold" if r["Status"] != "Usable" and c == "Status" else "" for c in r.index], axis=1)
+```
+
+**Example: generating reasons for one declined applicant.** For each declined applicant, the reasons are the features with the largest risk-raising SHAP values, translated with the table above and de-duplicated.
+
+```{python}
+#| label: example
+sample_p = booster.predict(sample)
+declined_idx = np.where(sample_p >= THRESHOLD)[0]
+def reasons_for(i, k=4):
+    contrib = pd.Series(sv[i], index=X.columns).sort_values(ascending=False)
+    out = []
+    for f, v in contrib.items():
+        if v <= 0: break
+        r = REASONS.get(f, (None, None))[1]
+        if r and r not in out and "prohibited" not in r and "review" not in r: out.append(r)
+        if len(out) == k: break
+    return out
+ex = declined_idx[np.argsort(-sample_p[declined_idx])][len(declined_idx) // 2]   # a typical (median-risk) declined applicant
+contrib = pd.Series(sv[ex], index=X.columns).sort_values(ascending=False).head(6)
+display(Markdown(f"Predicted default probability: **{sample_p[ex]:.1%}** (threshold {THRESHOLD:.0%}) → **Decline**"))
+pd.DataFrame({"Risk contribution (log-odds)": contrib.round(3).values,
+              "Reason": [REASONS.get(f, ("", "Other application information"))[1] for f in contrib.index]},
+             index=contrib.index)
+```
+
+```{python}
+#| label: notice
+display(Markdown("**Principal reasons stated on the adverse action notice:**\n\n" +
+                 "\n".join(f"{n}. {r}" for n, r in enumerate(reasons_for(ex), 1))))
+```
+
+```{python}
+#| label: reason-freq
+#| fig-height: 3.2
+first = pd.Series([reasons_for(i, 1)[0] for i in declined_idx if reasons_for(i, 1)]).value_counts(normalize=True)
+first = first[first >= 0.01].head(6)[::-1]
+fig, ax = plt.subplots(figsize=(8, 3.2))
+ax.barh(first.index, first.values, color=PURPLE)
+for i, v in enumerate(first.values):
+    ax.text(v + 0.005, i, f"{v:.0%}", va="center", fontsize=8)
+ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+ax.set_title(f"Most common #1 decline reason ({len(declined_idx)} declined applicants in the sample)")
+plt.tight_layout(); plt.show()
+```
+
+Limited external credit history is the dominant decline reason. That is accurate, but it means thin-file applicants, the customers Home Credit most wants to serve, are the ones most often declined, which reinforces the case for adding alternative data (Section 8).
+
+# Fairness analysis
+
+Approval rates at the `{python} f"{THRESHOLD:.0%}"` threshold, compared with each group's actual default rate. The **adverse impact ratio** divides each group's approval rate by the highest group's; values below 0.80 (the "four-fifths rule" used in U.S. disparate impact screening) warrant review.
+
+```{python}
+#| label: fairness
+approve = oof < THRESHOLD
+def fair_table(col, labels=None, min_n=500):
+    df = pd.DataFrame({"g": raw[col], "approved": approve, "default": y})
+    t = df.groupby("g").agg(Applicants=("approved", "size"), **{"Approval rate": ("approved", "mean")},
+                            **{"Actual default rate": ("default", "mean")})
+    t = t[t["Applicants"] >= min_n].sort_values("Approval rate", ascending=False)
+    t["Adverse impact ratio"] = t["Approval rate"] / t["Approval rate"].max()
+    good = df[df["default"] == 0].groupby("g")["approved"].mean()
+    t["Approval rate, good borrowers only"] = good.reindex(t.index)
+    if labels: t.index = t.index.map(lambda v: labels.get(v, v))
+    t.index.name = None
+    return t
+fmt = {"Applicants": "{:,}", "Approval rate": "{:.1%}", "Actual default rate": "{:.1%}",
+       "Adverse impact ratio": "{:.2f}", "Approval rate, good borrowers only": "{:.1%}"}
+def show(t):
+    return t.style.format(fmt).apply(lambda r: ["color:#B42318; font-weight:bold" if (c == "Adverse impact ratio" and r[c] < 0.8) else "" for c in r.index], axis=1)
+g_tbl = fair_table("CODE_GENDER", {"F": "Female", "M": "Male"})
+e_tbl = fair_table("NAME_EDUCATION_TYPE")
+```
+
+**By gender** (gender is not a model input):
+
+```{python}
+show(g_tbl)
+```
+
+**By education level** (education is a model input):
+
+```{python}
+show(e_tbl)
+```
+
+```{python}
+#| label: fairness-chart
+#| fig-height: 3.4
+both = pd.concat([g_tbl.assign(grp="Gender"), e_tbl.assign(grp="Education")])
+fig, ax = plt.subplots(figsize=(8, 3.4))
+idx = np.arange(len(both))
+ax.barh(idx, both["Approval rate"], color=[ORANGE if g == "Gender" else BLUE for g in both["grp"]], height=0.55, label="Approval rate")
+ax.scatter(both["Actual default rate"], idx, color=INK, zorder=3, s=18, label="Actual default rate")
+for i, (a, d) in enumerate(zip(both["Approval rate"], both["Actual default rate"])):
+    ax.text(a + 0.01, i, f"{a:.0%}", va="center", fontsize=8)
+ax.set_yticks(idx); ax.set_yticklabels(both.index); ax.invert_yaxis()
+ax.set_xlim(0, 1.05); ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0, decimals=0))
+ax.set_title(f"Approval rate (bars) and actual default rate (dots) at the {THRESHOLD:.0%} threshold")
+ax.legend(frameon=False, fontsize=8, loc="lower right"); plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| label: fairness-text
+g_air = g_tbl["Adverse impact ratio"].min(); e_min = e_tbl["Adverse impact ratio"].idxmin()
+```
+
+**Disparities and implications**
+
+- **Gender.** Men are approved less often than women (adverse impact ratio `{python} f"{g_air:.2f}"`), even though gender is not an input. Men in this data also default more often, so the gap largely tracks repayment, but the model may also be picking up gender through proxies (occupation, car ownership, external scores). Even among applicants who repaid, men are approved less often, which is the pattern regulators examine.
+- **Education.** The gaps are larger. `{python} e_min` applicants have the lowest approval rate (ratio `{python} f"{e_tbl.loc[e_min, 'Adverse impact ratio']:.2f}"`). Education is not a protected class under ECOA, but it correlates with income, age and national origin, so using it directly invites disparate impact claims, and it is a weak basis for an adverse action reason.
+- **What to do.** (1) Remove marital status, which is prohibited; (2) test a version without education and region and measure the accuracy cost; (3) run a formal disparate impact review (including age 62+) with compliance before deployment; (4) monitor approval and default rates by group every month after launch.
+
+```{python}
+#| label: no-marital
+nm = Path("../models/no_marital.json")
+nm_auc = json.loads(nm.read_text())["auc_no_marital"] if nm.exists() else None
+oof_auc = roc_auc_score(y, oof)
+thin = train["FLAG_THIN_FILE"].to_numpy() == 1
+auc_thin, auc_bureau = roc_auc_score(y[thin], oof[thin]), roc_auc_score(y[~thin], oof[~thin])
+```
+
+```{python}
+#| output: asis
+if nm_auc:
+    print(f"**Cost of the compliance fix.** Retraining with the same settings but without marital status gives a cross-validated AUC of "
+          f"**{nm_auc:.4f}** versus {oof_auc:.4f} with it, a change of {nm_auc - oof_auc:+.4f}. The prohibited variable can be removed at "
+          f"essentially no loss in accuracy.")
+```
+
+# Limitations and risks
+
+**Where the model might fail**
+
+- **Thin-file applicants.** AUC is `{python} f"{auc_thin:.3f}"` for the `{python} f"{thin.mean():.1%}"` of applicants with no bureau inquiry record versus `{python} f"{auc_bureau:.3f}"` for everyone else, and the top decline reason is missing external credit history: the model is least certain about exactly the customers the business wants to grow.
+- **Population drift.** The data are a historical snapshot. Changes in the economy, product mix, marketing channels or competitors' policies will shift who applies, and the score will degrade without monitoring and retraining.
+- **Selection bias.** The model learned only from loans that were approved in the past. It has never seen outcomes for people Home Credit declined, so its estimates for unusual profiles are extrapolations.
+- **Dependence on external scores.** The largest share of the model's signal comes from third-party scores whose methodology Home Credit does not control; if a provider changes its scoring, the model must be revalidated.
+
+**What data is missing**
+
+- Credit history tables (`bureau.csv`, `previous_application.csv`, installment payments) were not used in this version.
+- Verified income and real loan economics: margin, recoveries and collection costs are taken from published sources (Section 4), not Home Credit's books.
+- Alternative data that could help thin-file applicants (utility, telecom or transaction history).
+
+**Deployment risks**
+
+- **Legal and fairness.** Marital status must be removed; age, region and education need compliance review; adverse action reasons must be validated with legal counsel.
+- **Cutoff risk.** The profit-optimal threshold moves between about 5% and 22% under plausible cost assumptions; a wrong cutoff either loses money or declines too many good customers.
+- **Automation bias.** Loan officers may defer to the score; borderline cases should be reviewed by a person with the reasons visible.
+- **Monitoring plan.** Track AUC and calibration monthly on matured loans, approval and default rates by group, and the population stability of key inputs; retrain if AUC falls below 0.74 or calibration drifts.
+
+# References {.unnumbered}
+
+1. Home Credit B.V. (2019). *FY2018 and Q1 2019 Results Announcement* (net interest margin 15.8%, cost-to-income 42.2%, cost of risk 9.4%). <https://www.homecredit.net/wp-content/uploads/2022/11/190628-HCBV-FY18_Q1_2019-Results-Announcement.pdf>
+2. Basel Committee on Banking Supervision (2019). *Basel Framework, CRE32: IRB approach, risk components for each asset class*, paragraph 32.5 (45% LGD for senior unsecured claims). <https://www.bis.org/committees/bcbs/basel-framework/81364/chapter.pdf>
+3. De Almeida Filho, A. T., Mues, C., & Thomas, L. C. (2010). Optimizing the collections process in consumer credit. *Production and Operations Management*, 19(6), 698–708. Working paper: <https://eprints.soton.ac.uk/71322/1/CORMSIS-09-07.pdf>
+4. Mitchell, M. et al. (2019). Model Cards for Model Reporting. *FAT\* Conference*. <https://arxiv.org/abs/1810.03993>
+5. Consumer Financial Protection Bureau. *Regulation B (Equal Credit Opportunity Act), 12 CFR 1002.9: notifications and statement of specific reasons*. <https://www.consumerfinance.gov/rules-policy/regulations/1002/9/>
+6. Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions. *NeurIPS*. <https://arxiv.org/abs/1705.07874>
+
+# Use of AI {.unnumbered}
+
+I used Claude (Anthropic) to draft this model card, run the SHAP and threshold calculations, and locate published cost figures. I chose the cost assumptions, checked each source, and made the judgment calls on fairness and compliance.
