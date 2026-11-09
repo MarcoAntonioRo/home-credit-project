@@ -56,7 +56,7 @@ I worked through the full analytics lifecycle (CRISP-DM), with each stage feedin
 
 4. **Model card.** Set a decision threshold from researched lending economics (Home Credit's reported margins and published recovery rates), explained predictions with SHAP, translated the top features into legally required plain-language decline reasons, and tested approval rates across gender and education groups.
 
-![Default rate by model risk group](docs/images/risk_groups.png)
+![Default rate by model risk group](docs/images/risk_groups.svg)
 
 ## Business value
 
